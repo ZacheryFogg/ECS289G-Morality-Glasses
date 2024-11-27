@@ -2,7 +2,7 @@ import math
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-import numpy as n
+import numpy as np
 from transformers import RobertaForMaskedLM
 
 
@@ -16,6 +16,7 @@ class RobertaEmbeddings(nn.Module):
         super().__init__()
         self.word_embeddings = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
         self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
+        self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.hidden_size)
 
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
       
@@ -125,11 +126,11 @@ class LoraSdpaSelfAttention(RobertaSdpaSelfAttention):
     def __init__(self, config):
         super().__init__(config)
 
-        self.lora_q_B = nn.Parameter(torch.zeros(self.all_head_size, config.rank))
-        self.lora_q_A = nn.Parameter(torch.randn(config.rank, self.all_head_size))
+        self.lora_q_A = nn.Parameter(torch.zeros(self.all_head_size, config.rank))
+        self.lora_q_B = nn.Parameter(torch.randn(config.rank, self.all_head_size))
 
-        self.lora_v_B = nn.Parameter(torch.zeros(self.all_head_size, config.rank))
-        self.lora_v_A = nn.Parameter(torch.randn(config.rank, self.all_head_size))
+        self.lora_v_A = nn.Parameter(torch.zeros(self.all_head_size, config.rank))
+        self.lora_v_B = nn.Parameter(torch.randn(config.rank, self.all_head_size))
 
     def forward(self, hidden_states, attention_mask = None):
 
@@ -309,7 +310,7 @@ class RobertaClassificationHead(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.dense = nn.Linear(config.hidden_size, config.hidden_size)
-        self.out_proj = nn.Linear(config.hidden_size, config.num_class_labels)
+        self.out_proj = nn.Linear(config.hidden_size, config.num_labels)
 
     def forward(self, features):
         x = features[:, 0, :]  # take <s> token (equiv. to [CLS])
@@ -325,11 +326,12 @@ class RobertaClassificationHead(nn.Module):
 
 
 
+
 #############
 # Standard  #
 #############
 
-class RobertaClassificationAndLM(nn.Module):
+class RobertaClassificationAndLM3(nn.Module):
 
     def __init__(self, config):
         super().__init__()
@@ -343,7 +345,7 @@ class RobertaClassificationAndLM(nn.Module):
         # weight tying between input embedding and prediction head "de-embedding"
         self.lm_head.decoder.weight = self.roberta.embeddings.word_embeddings.weight 
 
-    def forward( self, input_ids, attention_mask, run_lm_head = False, run_classification_head = True):
+    def forward( self, input_ids, attention_mask = None, labels = None, run_lm_head = False, run_classification_head = True):
 
         outputs = self.roberta( input_ids, attention_mask=attention_mask)
 
@@ -360,53 +362,26 @@ class RobertaClassificationAndLM(nn.Module):
     @classmethod
     def from_pretrained(cls, config):
         """ Loading pretrained Roberta weights from hugging face """
+        # print("loading weights for %s" % model_type)
 
         # Random init of model
-        model = RobertaClassificationAndLM(config)
+        model = RobertaClassificationAndLM3(config)
         
         sd = model.state_dict()
+        sd_keys = sd.keys()
 
         # Init a Roberta from hugging face 
         model_hf = RobertaForMaskedLM.from_pretrained("FacebookAI/roberta-base")
-
         sd_hf = model_hf.state_dict()
         sd_hf_keys = [k for k in sd_hf.keys() if not k.endswith('lm_head.bias')]
-        sd_hf_keys = [k for k in sd_hf_keys if not k.endswith('roberta.embeddings.token_type_embeddings.weight')]
-
-        # Copy over weights from pre-trained models 
-        for key in sd_hf_keys:
+        # Copy over weights. State Dicts are currently in same order, so I can just blind copy 
+        for keys in zip(sd_keys, sd_hf_keys):
       
-            assert(sd[key].shape == sd_hf[key].shape)
+            assert(sd[keys[0]].shape == sd_hf[keys[1]].shape)
+            assert(keys[0] == keys[1])
             
             with torch.no_grad():
-                sd[key].copy_(sd_hf[key])
+                sd[keys[0]].copy_(sd_hf[keys[1]])
 
         return model
-
-# class AdapterRobertaClassificationAndLM(RobertaClassificationAndLM):
-#     def __init__(self, config):
-#         super(config).__init__()
-
-#     def freeze_base_weights(self):
-#         pass
-
-#     @classmethod
-#     def load_from_pretrained(cls, config):
-        
-#         model = AdapterRobertaClassificationAndLM(config)
-
-#         sd = model.state_dict()
-
-#         model_hf = RobertaForMaskedLM.from_pretrained("FacebookAI/roberta-base")
-#         sd_hf = model_hf.state_dict()
-
-#         sd_hf_keys = [k for k in sd_hf.keys() if not k.endswith('lm_head.bias')]
-
-#         for key in sd_hf_keys:
-
-#             assert(sd[key].shape == sd_hf[key].shape)
-
-#             with torch.no_grad():
-#                 sd[key].copy_(sd_hf[key])
-
-#         return model
+    
