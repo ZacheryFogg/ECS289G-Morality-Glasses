@@ -1,9 +1,28 @@
 import torch
 from torch.nn import functional as F
+import time
+from pynvml import *
+from tqdm.auto import tqdm
+import numpy as np
+import gc
+
 
 padding_idx = 1
 cls_idx = 0
-vocab_size = 50265
+vocab_size = 50265\
+
+
+def print_gpu_utilization():
+    nvmlInit()
+    handle = nvmlDeviceGetHandleByIndex(0)
+    info = nvmlDeviceGetMemoryInfo(handle)
+    print(f"GPU memory occupied: {info.used//1024**2} MB.")
+
+def get_gpu_mem_usage():
+    nvmlInit()
+    handle = nvmlDeviceGetHandleByIndex(0)
+    info = nvmlDeviceGetMemoryInfo(handle)
+    return info.used//1024**2
 
 def create_attention_mask(x, device, padding_idx = 1, dtype = torch.float, prefix_size = 0):
 
@@ -80,7 +99,7 @@ def calculate_accuracy_loss(model, dataset, device, prefix_size = 0):
             
     return (cls_correct / total) * 100, (moral_token_correct / total) * 100, lm_loss.item(), cls_loss.item()
 
-def calculate_loss(model, data, prefix_size = 0, is_val = False):
+def calculate_loss(model, data, device, prefix_size = 0):
      
     x, y_lm, y_cls = data['x'], data['y_lm'], data['y_cls']
 
@@ -98,11 +117,8 @@ def calculate_loss(model, data, prefix_size = 0, is_val = False):
     attn_mask = attn_mask.to(torch.float32)
 
     with torch.autocast(device_type = device, dtype = torch.bfloat16):
-        if is_val: 
-            with torch.no_grad():
-                token_preds_logits, cls_pred , _ = model(x, attention_mask = attn_mask, run_lm_head = True)
-        else: 
-            token_preds_logits, cls_pred , _ = model(x, attention_mask = attn_mask, run_lm_head = True)
+
+        token_preds_logits, cls_pred , _ = model(x, attention_mask = attn_mask, run_lm_head = True)
 
         # Calculate LM Loss 
         token_preds_logits = token_preds_logits.view(-1, token_preds_logits.size(-1)) # Flatten logits to (B * T, Vocab_Size)
@@ -116,6 +132,106 @@ def calculate_loss(model, data, prefix_size = 0, is_val = False):
         lm_loss + cls_loss
     
     return lm_loss, cls_loss
+
+def train_model(model, num_epochs, train_loader, val_loader, save_key, device, max_training_time = -1, prefix_size = 0, lr = 1e-4, save_best_model = True):
+
+    model.to(device)
+    
+    min_val_loss = np.inf
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr)
+
+    train_losses_lm = []
+    train_losses_cls = []
+
+    val_losses_lm = []
+    val_losses_cls = []
+    val_cls_accs = []
+    val_moral_token_accs = []
+
+    training_mem_usage = []
+    gpu_utilization = []
+    
+    
+    # Calculate accuracy and loss for training and validation sets before any training
+    # _, _, lm_loss_t, cls_loss_t = calculate_accuracy_loss(model, train_loader, device, prefix_size)
+    # cls_acc_v, moral_tokens_acc_v, lm_loss_v, cls_loss_v = calculate_accuracy_loss(model, val_loader, device, prefix_size)
+    
+    # # Track metrics 
+    # train_losses_lm.append(lm_loss_t), train_losses_cls.append(cls_loss_t)
+    # val_losses_lm.append(lm_loss_v), val_losses_cls.append(cls_loss_v), val_cls_accs.append(cls_acc_v), val_moral_token_accs.append(moral_tokens_acc_v)
+
+    start_time = time.time()
+    batch_num = 0
+    for epoch in range(num_epochs):
+        print(f'Epoch: {epoch}')
+        # Train model + Collect Metrics 
+        for data in tqdm(train_loader):
+            batch_num +=1 
+            
+            optimizer.zero_grad()
+
+            lm_loss, cls_loss = calculate_loss(model, data, device, prefix_size)
+
+            loss = lm_loss + cls_loss 
+
+            loss.backward()
+            optimizer.step()
+
+            train_losses_lm.append(lm_loss.item()), train_losses_cls.append(cls_loss.item())
+
+            # Track GPU memory usage
+            training_mem_usage.append(get_gpu_mem_usage())
+            
+            # Track GPU Utilization 
+            gpu_util = torch.cuda.utilization(torch.device('cuda'))
+            gpu_utilization.append(gpu_util)
+            # Stop early if training time exceeded
+            if max_training_time > 0:
+                elapsed_time = time.time() - start_time
+                if elapsed_time > max_training_time:
+                    break
+            # Validate model + Collect Metrics
+        cls_acc_v, moral_tokens_acc_v, lm_loss_v, cls_loss_v = calculate_accuracy_loss(model, val_loader, device, prefix_size)   
+        val_losses_lm.append(lm_loss_v), val_losses_cls.append(cls_loss_v), val_cls_accs.append(cls_acc_v), val_moral_token_accs.append(moral_tokens_acc_v)
+
+        # Report Validation Metrics
+        print(f'Val | CLS Acc: {cls_acc_v:.4} | Moral Acc: {round(moral_tokens_acc_v, 3)} | LM Loss {round(lm_loss_v, 5)} | CLS Loss {round(cls_loss_v, 5)}')
+        
+        # Save Best Model
+        val_loss = lm_loss_v + cls_loss_v
+
+        if val_loss < min_val_loss:
+            min_val_loss = val_loss
+
+            torch.save(model.state_dict(), f'./trained_models/{save_key}')
+        
+        # Stop early if training time exceeded
+        if max_training_time > 0:
+            elapsed_time = time.time() - start_time
+            if elapsed_time > max_training_time:
+                print(f'Training time limit exceeded at {batch_num}/{len(train_loader) * (epoch + 1)} batches')
+                break
+            
+    results_dict = {
+        'train_losses_lm' : train_losses_lm,
+        'train_losses_cls' : train_losses_cls,
+        'val_losses_lm' : val_losses_lm,
+        'val_losses_cls' : val_losses_cls,
+        'val_cls_accs' : val_cls_accs,
+        'val_moral_token_accs' : val_moral_token_accs,
+        'training_mem_usage' : training_mem_usage,
+        'gpu_utilization' : gpu_utilization
+
+    }
+
+    # Cleaing up resources 
+    del model
+    del optimizer
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    return results_dict
 
 def print_token_from_logits(logits, tokenizer):
 
