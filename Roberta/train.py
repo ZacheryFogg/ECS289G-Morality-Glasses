@@ -165,7 +165,7 @@ models ={
 
 training_results ={}
 epochs = 100 # Models will not actually get to train for this long
-max_training_time = 20 # Max training time per model is 180s, this is the training compute cap
+max_training_time = 180 # Max training time per model is 180s, this is the training compute cap
 
 for key in models.keys():
     print(f'\n{key}\n')
@@ -193,7 +193,7 @@ with open('results/capped_180_training.json', 'w') as f:
 
 training_results ={}
 epochs = 100 
-max_training_time = 40 # Max training time per model is 180s, this is the training compute cap
+max_training_time = 600 # Max training time per model is 180s, this is the training compute cap
 
 for key in models.keys():
     print(f'\n{key}\n')
