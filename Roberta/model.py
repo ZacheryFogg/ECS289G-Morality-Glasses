@@ -174,70 +174,88 @@ class RobertaAttention(nn.Module):
         else: 
             self.self = RobertaSelfAttention(config)
 
-        self.output = RobertaSelfOutput(config)
+        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
 
-    def forward(self, hidden_states,attention_mask = None):
+    def forward(self, hidden_states, attention_mask = None):
         
         self_outputs = self.self( hidden_states, attention_mask)
-        attention_output = self.output(self_outputs, hidden_states)
+
+        attention_output = self.dense(self_outputs)
         
         return attention_output
-
-
-class RobertaSelfOutput(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-
-    def forward(self, hidden_states, input_tensor):
-        hidden_states = self.dense(hidden_states)
-        hidden_states = self.LayerNorm(hidden_states + input_tensor)
-        return hidden_states
-
-
-class RobertaIntermediate(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.dense = nn.Linear(config.hidden_size, config.intermediate_size)
-        self.intermediate_act_fn = nn.GELU()
-
-    def forward(self, hidden_states):
-        hidden_states = self.dense(hidden_states)
-        hidden_states = self.intermediate_act_fn(hidden_states)
-        return hidden_states 
     
-
-
-class RobertaOutput(nn.Module):
+class FeedForwardNetwork(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.up_projection = nn.Linear(config.hidden_size, config.intermediate_size)
+        self.down_projection = nn.Linear(config.intermediate_size, config.hidden_size)
 
-    def forward(self, hidden_states, input_tensor):
-        hidden_states = self.dense(hidden_states)
-        hidden_states = self.LayerNorm(hidden_states + input_tensor)
-        return hidden_states
+    def forward(self, x):
+        x = self.up_projection(x)
+        x = F.gelu(x)
+        x = self.down_projection(x)
+        return x
     
+class BottleNeckAdapterFFN(nn.Module):
+    def __init__(self,config):
+        super().__init__()
+        self.down_projection = nn.Parameter(torch.zeros(config.hidden_size, config.bottleneck_size))
+        self.up_projection = nn.Parameter(torch.randn(config.bottleneck_size, config.hidden_size))
 
+    def forward(self, x):
+        x = torch.matmul(x, self.down_projection)
+        x = F.gelu(x)
+        x = torch.matmul(x, self.up_projection)
 
+        return x
+    
 class RobertaLayer(nn.Module):
     def __init__(self, config):
         super().__init__()
         
         self.attention = RobertaAttention(config)
-        self.intermediate = RobertaIntermediate(config)
-        self.output = RobertaOutput(config)
+        self.LayerNorm1 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+
+        self.ffn = FeedForwardNetwork(config)
+        self.LayerNorm2 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
     def forward( self, hidden_states, attention_mask = None):
-        # decoder uni-directional self-attention cached key/values tuple is at positions 1,2
-        self_attention_outputs = self.attention( hidden_states, attention_mask)
-        attention_output = self_attention_outputs
 
-        intermediate_output = self.intermediate(attention_output)
-        layer_output = self.output(intermediate_output, attention_output)
+        attention_outputs = self.attention( hidden_states, attention_mask)
+        hidden_states = self.LayerNorm1(attention_outputs + hidden_states)
+
+        ffn_outputs = self.ffn(hidden_states)
+        layer_output = self.LayerNorm2(ffn_outputs + hidden_states)
         
+        return layer_output
+
+class BottleneckAdapterRobertaLayer(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        
+        self.attention = RobertaAttention(config)
+        self.LayerNorm1 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+
+        self.ffn = FeedForwardNetwork(config)
+        self.LayerNorm2 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+
+        self.bottleneck = BottleNeckAdapterFFN(config)
+        self.LayerNorm_bottleneck = nn.LayerNorm(config.hidden_size, eps = config.layer_norm_eps)
+
+    def forward( self, hidden_states, attention_mask = None):
+
+        attention_outputs = self.attention( hidden_states, attention_mask)
+        attn_hidden_states = self.LayerNorm1(attention_outputs + hidden_states)
+
+        ffn_raw_outputs = self.ffn(attn_hidden_states)
+        ffn_outputs = self.LayerNorm_bottleneck(ffn_raw_outputs + attn_hidden_states)
+
+        bottleneck_output = self.bottleneck(ffn_outputs)
+
+        bottleneck_output = bottleneck_output + ffn_raw_outputs
+
+        layer_output = self.LayerNorm2(bottleneck_output + attn_hidden_states)
+
         return layer_output
     
 
@@ -245,7 +263,11 @@ class RobertaEncoder(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.layer = nn.ModuleList([RobertaLayer(config) for _ in range(config.num_hidden_layers)])
+
+        if config.use_bottleneck:
+            self.layer = nn.ModuleList([BottleneckAdapterRobertaLayer(config) for _ in range(config.num_hidden_layers)])
+        else:
+            self.layer = nn.ModuleList([RobertaLayer(config) for _ in range(config.num_hidden_layers)])
 
     def forward( self, hidden_states, attention_mask = None):
         
@@ -260,6 +282,23 @@ class RobertaEncoder(nn.Module):
 
         return hidden_states
 
+class PrefixParameters(nn.Module):
+    
+    def __init__(self, config):
+        super().__init__()
+        self.prefix_size = config.prefix_size
+        # self.prefix_params = nn.Parameter(torch.zeros(1, config.prefix_size, config.hidden_size))
+        self.prefix_params = nn.Parameter(torch.randn(1, config.prefix_size, config.hidden_size))
+
+        
+    
+    def add_prefix(self, x):
+        x = torch.cat((self.prefix_params.repeat(x.shape[0], 1, 1) ,x), dim = 1)
+        return x 
+    
+    def remove_prefix(self, x):
+        x = x[:,self.prefix_size :,:]
+        return x
 
 class RobertaModel(nn.Module):
 
@@ -269,13 +308,24 @@ class RobertaModel(nn.Module):
         self.config = config
 
         self.embeddings = RobertaEmbeddings(config)
+
+        if config.use_prefix:
+            self.prefix = PrefixParameters(config)
+
         self.encoder = RobertaEncoder(config)
+
 
     def forward(self, input_ids, attention_mask = None):
      
         embedding_output = self.embeddings(input_ids=input_ids)
 
+        if self.config.use_prefix:
+            embedding_output = self.prefix.add_prefix(embedding_output)
+
         encoder_outputs = self.encoder( embedding_output, attention_mask=attention_mask)
+
+        if self.config.use_prefix: 
+            encoder_outputs = self.prefix.remove_prefix(encoder_outputs)
         
         return encoder_outputs
     
@@ -374,39 +424,42 @@ class RobertaClassificationAndLM(nn.Module):
         sd_hf_keys = [k for k in sd_hf_keys if not k.endswith('roberta.embeddings.token_type_embeddings.weight')]
 
         # Copy over weights from pre-trained models 
+        key_map = {
+            'attention.self.query.weight' : 'attention.self.query.weight',
+            'attention.self.query.bias' : 'attention.self.query.bias',
+            'attention.self.key.weight' : 'attention.self.key.weight',
+            'attention.self.key.bias' : 'attention.self.key.bias',
+            'attention.self.value.weight' : 'attention.self.value.weight',
+            'attention.self.value.bias' : 'attention.self.value.bias',
+            'attention.output.dense.weight' : 'attention.dense.weight',
+            'attention.output.dense.bias' : 'attention.dense.bias',
+            'attention.output.LayerNorm.weight' : 'LayerNorm1.weight',
+            'attention.output.LayerNorm.bias' : 'LayerNorm1.bias',
+            'intermediate.dense.weight' : 'ffn.up_projection.weight',
+            'intermediate.dense.bias' : 'ffn.up_projection.bias',
+            'output.dense.weight' : 'ffn.down_projection.weight',
+            'output.dense.bias' : 'ffn.down_projection.bias',
+            'output.LayerNorm.weight' : 'LayerNorm2.weight',
+            'output.LayerNorm.bias' : 'LayerNorm2.bias',
+        }
         for key in sd_hf_keys:
-      
-            assert(sd[key].shape == sd_hf[key].shape)
+            
+            correct_key = None
+
+            name = key.split('.')
+
+            if name[2] == 'layer' and 'lora' not in key and 'bottleneck' not in key and 'prefix' not in key:
+                l_num = name[3]
+                prefix_name = f'roberta.encoder.layer.{l_num}.'
+                suffix_name = key.split(l_num + '.')[1]
+                correct_key = prefix_name + key_map[suffix_name]
+            else: 
+                correct_key = key
+
+
+            assert(sd[correct_key].shape == sd_hf[key].shape)
             
             with torch.no_grad():
-                sd[key].copy_(sd_hf[key])
+                sd[correct_key].copy_(sd_hf[key])
 
         return model
-
-# class AdapterRobertaClassificationAndLM(RobertaClassificationAndLM):
-#     def __init__(self, config):
-#         super(config).__init__()
-
-#     def freeze_base_weights(self):
-#         pass
-
-#     @classmethod
-#     def load_from_pretrained(cls, config):
-        
-#         model = AdapterRobertaClassificationAndLM(config)
-
-#         sd = model.state_dict()
-
-#         model_hf = RobertaForMaskedLM.from_pretrained("FacebookAI/roberta-base")
-#         sd_hf = model_hf.state_dict()
-
-#         sd_hf_keys = [k for k in sd_hf.keys() if not k.endswith('lm_head.bias')]
-
-#         for key in sd_hf_keys:
-
-#             assert(sd[key].shape == sd_hf[key].shape)
-
-#             with torch.no_grad():
-#                 sd[key].copy_(sd_hf[key])
-
-#         return model

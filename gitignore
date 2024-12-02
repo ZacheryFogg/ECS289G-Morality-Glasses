@@ -1,3 +1,5 @@
 .DS_Store
 Roberta/trained_models/
 .ipynb_checkpoints
+Roberta/trained_models
+trained_models/*
