@@ -239,3 +239,32 @@ def print_token_from_logits(logits, tokenizer):
         probs = F.softmax(logits[i])
         pred_idx = probs.argmax(-1)
         print(tokenizer.decode(pred_idx))
+
+
+def calculate_wikitext_loss(model, wikitext_loader, device, prefix_size = 0):
+    running_loss = 0
+
+    for data in wikitext_loader:
+        x, y = data['x'], data['y']
+
+
+        y = F.one_hot(y, num_classes = 50265).float()
+        y[:,:,0] =  y[:,:,0] * 0 # Set target of all 0 tokens to 0 vector so no loss contribution
+        
+        y = y.to(device)
+        x = x.to(device)
+
+        attn_mask = create_attention_mask(x, device, dtype = torch.bfloat16, prefix_size = prefix_size)
+        attn_mask = attn_mask.to(torch.float32)
+
+        with torch.autocast(device_type = device, dtype = torch.bfloat16) and torch.no_grad():
+            token_preds_logits, _ , _ = model(x, attention_mask = attn_mask, run_lm_head = True, run_classification_head = False)
+
+        token_preds_logits = token_preds_logits.view(-1, token_preds_logits.size(-1)) # Flatten logits to (B * T, Vocab_Size)
+        y = y.view(-1, y.size(-1)) # Flatten targets to (B * T, Vocab_Size)
+
+
+        loss = F.cross_entropy(token_preds_logits, y)
+        running_loss += loss.item()
+
+    return running_loss / len(wikitext_loader)
