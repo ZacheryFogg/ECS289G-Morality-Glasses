@@ -164,13 +164,16 @@ class LoraSdpaSelfAttention(RobertaSdpaSelfAttention):
         return outputs
 
 class RobertaAttention(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, layer_num):
         super().__init__()
 
         if config.attn_type == 'spda':
             self.self = RobertaSdpaSelfAttention(config)
         elif config.attn_type == 'lora_spda':
-            self.self = LoraSdpaSelfAttention(config)
+            if layer_num in config.mod_layers:
+                self.self = LoraSdpaSelfAttention(config)
+            else:
+                self.self = RobertaSdpaSelfAttention(config)
         else: 
             self.self = RobertaSelfAttention(config)
 
@@ -210,10 +213,10 @@ class BottleNeckAdapterFFN(nn.Module):
         return x
     
 class RobertaLayer(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, layer_num):
         super().__init__()
         
-        self.attention = RobertaAttention(config)
+        self.attention = RobertaAttention(config, layer_num)
         self.LayerNorm1 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
         self.ffn = FeedForwardNetwork(config)
@@ -230,10 +233,10 @@ class RobertaLayer(nn.Module):
         return layer_output
 
 class BottleneckAdapterRobertaLayer(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, layer_num):
         super().__init__()
         
-        self.attention = RobertaAttention(config)
+        self.attention = RobertaAttention(config, layer_num)
         self.LayerNorm1 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
         self.ffn = FeedForwardNetwork(config)
@@ -264,11 +267,16 @@ class RobertaEncoder(nn.Module):
         super().__init__()
         self.config = config
 
-        if config.use_bottleneck:
-            self.layer = nn.ModuleList([BottleneckAdapterRobertaLayer(config) for _ in range(config.num_hidden_layers)])
-        else:
-            self.layer = nn.ModuleList([RobertaLayer(config) for _ in range(config.num_hidden_layers)])
+        # Only apply special architecture modifications to specific layers 
+        layers = []
+        for layer_num in range(config.num_hidden_layers):
 
+            if config.use_bottleneck and layer_num in config.mod_layers:
+                layers.append(BottleneckAdapterRobertaLayer(config, layer_num))
+            else:
+                layers.append(RobertaLayer(config, layer_num))
+
+        self.layer = nn.ModuleList(layers)
     def forward( self, hidden_states, attention_mask = None):
         
         for i, layer_module in enumerate(self.layer):
@@ -287,10 +295,7 @@ class PrefixParameters(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.prefix_size = config.prefix_size
-        # self.prefix_params = nn.Parameter(torch.zeros(1, config.prefix_size, config.hidden_size))
-        self.prefix_params = nn.Parameter(torch.randn(1, config.prefix_size, config.hidden_size))
-
-        
+        self.prefix_params = nn.Parameter(torch.zeros(1, config.prefix_size, config.hidden_size))
     
     def add_prefix(self, x):
         x = torch.cat((self.prefix_params.repeat(x.shape[0], 1, 1) ,x), dim = 1)
