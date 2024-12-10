@@ -4,6 +4,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 import numpy as n
 from transformers import RobertaForMaskedLM
+from dataclasses import dataclass, field
 
 
 
@@ -411,9 +412,80 @@ class RobertaClassificationAndLM(nn.Module):
             classification_scores = self.classification_head(outputs)
 
         return token_predictions, classification_scores, outputs
+
+    @classmethod 
+    def from_ethics_pretrained(cls, config, size = 'large'):
+
+        @dataclass 
+        class RobertaLargeConfig:
+            mod_layers: list = field(default_factory=lambda: list(range(24)))
+            vocab_size: int = 50265
+            hidden_size: int = 1024
+            num_hidden_layers: int = 24
+            num_attention_heads: int = 16
+            intermediate_size: int = 4096
+            max_position_embeddings: int = 514
+            layer_norm_eps: float = 1e-05
+            num_class_labels: int = 1
+            pad_token_id: int = 1
+
+            # Special Configs 
+            rank: int = None
+            attn_type: str = 'spda'
+            use_bottleneck: bool = False
+            bottleneck_size: int = None
+            prefix_size: int = None
+            use_prefix: bool = False
+
+        @dataclass 
+        class RobertaBaseConfig:
+            mod_layers: list = field(default_factory=lambda: list(range(12)))
+            vocab_size: int = 50265
+            hidden_size: int = 768
+            num_hidden_layers: int = 12
+            num_attention_heads: int = 12
+            intermediate_size: int = 3072
+            max_position_embeddings: int = 514
+            layer_norm_eps: float = 1e-05
+            num_class_labels: int = 1
+            pad_token_id: int = 1
+
+            # Special Configs 
+            rank: int = None
+            attn_type: str = 'spda'
+            use_bottleneck: bool = False
+            bottleneck_size: int = None
+            prefix_size: int = None
+            use_prefix: bool = False
+
+        model = RobertaClassificationAndLM(config)
+
+        sd = model.state_dict()
+        
+        c = None
+        if size == 'large':
+            c = RobertaLargeConfig()
+        else:
+            c = RobertaBaseConfig()
+
+        ethics_model = RobertaClassificationAndLM(c)
+        # ethics_model.load_state_dict(torch.load(f'./trained_models/{size}/base_ethics_model', weights_only = True))
+        ethics_model.load_state_dict(torch.load(f'./trained_models/{size}/base_ethics_model_cls_only', weights_only = True))
+
+
+        sd_ethics = ethics_model.state_dict()
+
+        for key in sd_ethics.keys():
+            
+            assert(sd[key].shape == sd_ethics[key].shape)
+            
+            with torch.no_grad():
+                sd[key].copy_(sd_ethics[key])
+
+        return model
     
     @classmethod
-    def from_pretrained(cls, config):
+    def from_pretrained(cls, config, size = 'large'):
         """ Loading pretrained Roberta weights from hugging face """
 
         # Random init of model
@@ -422,7 +494,7 @@ class RobertaClassificationAndLM(nn.Module):
         sd = model.state_dict()
 
         # Init a Roberta from hugging face 
-        model_hf = RobertaForMaskedLM.from_pretrained("FacebookAI/roberta-base")
+        model_hf = RobertaForMaskedLM.from_pretrained(f'FacebookAI/roberta-{size}')
 
         sd_hf = model_hf.state_dict()
         sd_hf_keys = [k for k in sd_hf.keys() if not k.endswith('lm_head.bias')]
