@@ -469,8 +469,7 @@ class RobertaClassificationAndLM(nn.Module):
             c = RobertaBaseConfig()
 
         ethics_model = RobertaClassificationAndLM(c)
-        # ethics_model.load_state_dict(torch.load(f'./trained_models/{size}/base_ethics_model', weights_only = True))
-        ethics_model.load_state_dict(torch.load(f'./trained_models/{size}/base_ethics_model_cls_only', weights_only = True))
+        ethics_model.load_state_dict(torch.load(f'./trained_models/{size}/base_ethics_model', weights_only = True))
 
 
         sd_ethics = ethics_model.state_dict()
